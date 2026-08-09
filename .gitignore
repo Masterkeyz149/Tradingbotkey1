@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+local_dev.db
+backtest_results.json
+.DS_Store
+node_modules/
+*.egg-info/

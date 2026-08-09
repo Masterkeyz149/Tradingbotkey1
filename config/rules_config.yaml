@@ -1,0 +1,84 @@
+# Single source of truth for the methodology, editable without touching code.
+# The LLM confirmation layer is given this file verbatim as context.
+
+timeframe_alignment:
+  bias: "4H"
+  setup: "30M"
+  execution: "5M"
+  rule: "Only trade when bias, setup, and execution timeframes agree."
+
+killzones_uk_time:
+  asia: { start: "19:30", end: "22:30", role: "builds the range" }
+  london: { start: "01:30", end: "04:30", role: "sweeps liquidity" }
+  new_york: { start: "14:00", end: "15:30", role: "expansion" }
+  rule: "Trade the expansion, not the range."
+
+entry_checklist:
+  - id: htf_bias_aligned
+    description: "Higher-timeframe bias aligned across 4H/30M/5M"
+  - id: liquidity_taken
+    description: "Liquidity sweep occurred before the move"
+  - id: structure_break_confirmed
+    description: "Structure break confirmed on a close, not a wick"
+  - id: displacement_present
+    description: "Displacement present (FVG formed)"
+  - id: price_in_ote
+    description: "Price retraced into the OTE zone (0.618-0.786), 0.618 is primary trigger"
+  - id: risk_within_cap
+    description: "Risk within the 1-2% cap"
+
+risk:
+  max_risk_pct_per_trade: 2.0
+  min_reward_to_risk: 2.0
+  stops_mandatory: true
+
+instruments:
+  - symbol: "XAUUSD"
+    strategy: "ote"
+    correlated_with: "AUDUSD"
+  - symbol: "BTCUSD"
+    strategy: "htf_fvg"
+    correlated_with: "ETHUSD"
+  - symbol: "EURUSD"
+    strategy: "crt_4h"
+    correlated_with: "GBPUSD"
+  - symbol: "USDJPY"
+    strategy: "liquidity_hunt_reversal"
+    correlated_with: "CADJPY"
+  - symbol: "US30"
+    strategy: "session_breakout"
+    correlated_with: "NAS100"
+  - symbol: "AUDUSD"
+    strategy: "smt_divergence_reversal"
+    correlated_with: "NZDUSD"
+  - symbol: "USDCAD"
+    strategy: "momentum_continuation"
+    correlated_with: "DXY"
+
+crt_rules:
+  applies_to: ["EURUSD"]
+  reference_timeframe: "4H"
+  confirmation_timeframe: "M15"
+  three_candle_rule: "Candle 1 = range, Candle 2 = liquidation, Candle 3 = re-entry confirmation close inside range"
+  mitigation_rule: "A CRT zone is valid only the first time price touches it after forming"
+  daily_bias_filter: "Only take CRT setups aligned with the daily bias; counter-trend CRTs have a materially lower win rate"
+  confidence_tiers:
+    high: "sweep candle itself closes back inside the parent range AND a confirmation candle closes beyond swept level"
+    medium: "sweep candle closes outside the range, but a later confirmation candle closes beyond the swept level (valid under Wyckoff view, lower certainty)"
+    invalid: "no confirmation candle at all, regardless of where the sweep candle closed"
+
+smt_rules:
+  applies_to: ["AUDUSD"]
+  correlated_pairs:
+    - ["AUDUSD", "NZDUSD"]
+    - ["EURUSD", "GBPUSD"]
+    - ["US100", "US500"]
+    - ["XAUUSD", "XAGUSD"]
+  prefer_timeframes: ["1H", "4H"]
+  rule: "Favor SMT on 1H/4H; combine with other confluences; wait for structure shift after divergence; check economic calendar for news-driven unreliability"
+
+van_tharp_principles:
+  mistake_definition: "A mistake is not following your own rules"
+  track_in_r_multiples: true
+  min_reward_to_risk_ideal: 3.0
+  note: "Governs system evaluation and sizing, not entries -- do not use to justify individual entries"

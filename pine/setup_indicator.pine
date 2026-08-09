@@ -1,0 +1,372 @@
+//@version=5
+// =============================================================================
+// SETUP DETECTOR — Market Structure + CRT + SMT confirmation indicator
+//
+// Hardcoded, objective detection only (no discretionary judgment). Everything
+// requiring judgment (multi-timeframe coherence, sweep quality, checklist
+// pass/fail, instrument-strategy cross-check) is deferred to the backend LLM
+// confirmation layer via the webhook payload.
+//
+// Run this on your SETUP timeframe (30M per methodology). It pulls 4H bias
+// and 5M execution context via request.security().
+// =============================================================================
+indicator("Setup Detector (Structure/CRT/SMT)", overlay = true, max_lines_count = 200, max_labels_count = 200)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+grpStruct = "Structure / BOS / CHOCH"
+pivotLen        = input.int(5, "Pivot lookback (bars each side)", group = grpStruct, minval = 2)
+
+grpDisp = "Displacement / FVG / OTE"
+dispBodyRatio   = input.float(0.6, "Min body-to-range ratio for displacement", group = grpDisp, minval = 0.1, maxval = 1.0, step = 0.05)
+fibTriggerLevel = input.float(0.618, "OTE primary trigger level", group = grpDisp)
+fibZoneLow      = input.float(0.5, "OTE zone start (discount/premium boundary)", group = grpDisp)
+fibZoneHigh     = input.float(0.786, "OTE zone end", group = grpDisp)
+
+grpKillzone = "Killzones (UK time)"
+useKillzoneFilter = input.bool(true, "Only signal inside a killzone", group = grpKillzone)
+asiaStart   = input.session("1930-2230", "Asia (range-build)", group = grpKillzone)
+londonStart = input.session("0130-0430", "London (sweep)", group = grpKillzone)
+nyStart     = input.session("1400-1530", "New York (expansion)", group = grpKillzone)
+
+grpCRT = "Candle Range Theory (CRT)"
+enableCRT       = input.bool(false, "Enable CRT detection (e.g. EURUSD 4H)", group = grpCRT)
+crtRefTF        = input.timeframe("240", "CRT reference timeframe (H1/H4/D1)", group = grpCRT)
+crtConfirmTF    = input.timeframe("15", "CRT confirmation timeframe (e.g. M15)", group = grpCRT)
+dailyBiasTF     = input.timeframe("D", "Daily bias timeframe (for CRT directional filter)", group = grpCRT)
+
+grpSMT = "SMT Divergence"
+enableSMT       = input.bool(false, "Enable SMT divergence detection", group = grpSMT)
+correlatedSym   = input.symbol("FX:NZDUSD", "Correlated symbol", group = grpSMT)
+smtPivotLen     = input.int(5, "SMT pivot lookback (each side)", group = grpSMT)
+
+grpMTF = "Multi-Timeframe Context"
+biasTF      = input.timeframe("240", "Bias timeframe (4H)", group = grpMTF)
+execTF      = input.timeframe("5", "Execution timeframe (5M)", group = grpMTF)
+
+grpRisk = "Risk"
+accountEquity   = input.float(10000, "Account equity (for risk % calc)", group = grpRisk)
+riskCapPct      = input.float(2.0, "Max risk % per trade", group = grpRisk, minval = 0.1, maxval = 10)
+
+grpWebhook = "Webhook"
+webhookSymbolOverride = input.string("", "Symbol override for payload (blank = use syminfo.ticker)", group = grpWebhook)
+
+// -----------------------------------------------------------------------------
+// KILLZONE FILTER (UK time)
+// -----------------------------------------------------------------------------
+inAsia   = not na(time(timeframe.period, asiaStart,   "Europe/London"))
+inLondon = not na(time(timeframe.period, londonStart, "Europe/London"))
+inNY     = not na(time(timeframe.period, nyStart,     "Europe/London"))
+inKillzone = inAsia or inLondon or inNY
+killzoneName = inLondon ? "london" : inNY ? "new_york" : inAsia ? "asia" : "none"
+
+// -----------------------------------------------------------------------------
+// STRUCTURE DETECTION — closes only (wicks do not count)
+// -----------------------------------------------------------------------------
+// Pivot high/low computed off the CLOSE series, not high/low, per methodology.
+pivHighClose = ta.pivothigh(close, pivotLen, pivotLen)
+pivLowClose  = ta.pivotlow(close, pivotLen, pivotLen)
+
+var float lastStructHigh = na
+var float lastStructLow  = na
+var float prevStructHigh = na
+var float prevStructLow  = na
+
+if not na(pivHighClose)
+    prevStructHigh := lastStructHigh
+    lastStructHigh := pivHighClose
+
+if not na(pivLowClose)
+    prevStructLow := lastStructLow
+    lastStructLow := pivLowClose
+
+// Bullish/bearish order flow: HH+HL vs LL+LH
+bullishStructure = not na(lastStructHigh) and not na(prevStructHigh) and not na(lastStructLow) and not na(prevStructLow) and lastStructHigh > prevStructHigh and lastStructLow > prevStructLow
+bearishStructure = not na(lastStructHigh) and not na(prevStructHigh) and not na(lastStructLow) and not na(prevStructLow) and lastStructHigh < prevStructHigh and lastStructLow < prevStructLow
+
+// -----------------------------------------------------------------------------
+// BOS — strong-bodied candle with a clear CLOSE beyond prior structure point
+// -----------------------------------------------------------------------------
+candleRange = high - low
+candleBody  = math.abs(close - open)
+isStrongBody = candleRange > 0 and (candleBody / candleRange) >= dispBodyRatio
+
+bosUp   = isStrongBody and not na(lastStructHigh) and close > lastStructHigh and close[1] <= lastStructHigh
+bosDown = isStrongBody and not na(lastStructLow)  and close < lastStructLow  and close[1] >= lastStructLow
+
+// -----------------------------------------------------------------------------
+// CHOCH — first structural failure (early warning, not confirmation)
+// A CHOCH is a close beyond the most recent MINOR structure point in the
+// opposite direction of prevailing structure, without yet clearing the major
+// swing that a BOS would require. Modeled here as: bearish CHOCH = close
+// breaks below the last minor higher-low while prevailing structure is
+// bullish (and vice versa). Full BOS (above) is still required to confirm.
+// -----------------------------------------------------------------------------
+var bool trendIsBullish = na
+if bosUp
+    trendIsBullish := true
+if bosDown
+    trendIsBullish := false
+
+chochBearish = trendIsBullish and not na(lastStructLow) and close < lastStructLow and not bosDown
+chochBullish = not trendIsBullish and not na(lastStructHigh) and close > lastStructHigh and not bosUp
+
+// -----------------------------------------------------------------------------
+// DISPLACEMENT + FAIR VALUE GAP (FVG) — 3-bar imbalance, strong body / minimal wick
+// -----------------------------------------------------------------------------
+displacementUp   = isStrongBody and close > open
+displacementDown = isStrongBody and close < open
+
+// Bullish FVG: gap between bar[2] high and current low (bar[1] is the displacement candle)
+bullFVG = displacementUp[1] and low > high[2]
+bullFVGTop = low
+bullFVGBottom = high[2]
+
+// Bearish FVG: gap between bar[2] low and current high
+bearFVG = displacementDown[1] and high < low[2]
+bearFVGTop = low[2]
+bearFVGBottom = high
+
+// No displacement = no trade -> only proceed to OTE calc when an FVG exists.
+
+// -----------------------------------------------------------------------------
+// FIBONACCI OTE — off the LAST confirmed displacement leg only
+// -----------------------------------------------------------------------------
+var float legStart = na   // start of last displacement leg (pre-displacement extreme)
+var float legEnd   = na   // end of last displacement leg (post-displacement extreme)
+var bool  legIsBullish = na
+
+if bullFVG
+    legStart := low[2]     // pre-displacement low approx (swept low area)
+    legEnd   := high[1]    // displacement candle high
+    legIsBullish := true
+
+if bearFVG
+    legStart := high[2]
+    legEnd   := low[1]
+    legIsBullish := false
+
+oteHigh = na(legStart) ? na : (legIsBullish ? legEnd - (legEnd - legStart) * fibZoneLow  : legEnd + (legStart - legEnd) * fibZoneLow)
+oteLow  = na(legStart) ? na : (legIsBullish ? legEnd - (legEnd - legStart) * fibZoneHigh : legEnd + (legStart - legEnd) * fibZoneHigh)
+oteTrigger = na(legStart) ? na : (legIsBullish ? legEnd - (legEnd - legStart) * fibTriggerLevel : legEnd + (legStart - legEnd) * fibTriggerLevel)
+
+priceInOTE = not na(oteHigh) and not na(oteLow) and close <= oteHigh and close >= oteLow
+priceAtTrigger = not na(oteTrigger) and math.abs(close - oteTrigger) <= (candleRange * 0.5)
+
+// -----------------------------------------------------------------------------
+// RISK % CALCULATOR — off stop distance, not fixed lot size
+// -----------------------------------------------------------------------------
+// Stop is taken as the sweep extreme (legStart) for the active leg; this is a
+// reference calc only — actual stop/size confirmation happens downstream.
+stopDistance = na(legStart) ? na : math.abs(close - legStart)
+riskPctOfEquity = na(stopDistance) ? na : (stopDistance / close) * 100  // placeholder; real position sizing uses account equity + instrument contract specs downstream
+riskWithinCap = na(riskPctOfEquity) ? false : riskPctOfEquity <= riskCapPct
+
+// -----------------------------------------------------------------------------
+// MULTI-TIMEFRAME CONTEXT (bias + execution) — passed through, not judged here
+// -----------------------------------------------------------------------------
+[biasClose, biasHTFHigh, biasHTFLow] = request.security(syminfo.tickerid, biasTF, [close, high, low], lookahead = barmerge.lookahead_off)
+[execClose, execHigh, execLow]       = request.security(syminfo.tickerid, execTF, [close, high, low], lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// CRT — Candle Range Theory (reference / liquidation / re-entry, 3-candle rule)
+// -----------------------------------------------------------------------------
+var float crtRefHigh = na
+var float crtRefLow  = na
+var bool  crtLowSwept  = false
+var bool  crtHighSwept = false
+var bool  crtZoneMitigatedBull = false
+var bool  crtZoneMitigatedBear = false
+
+[refHigh, refLow, refClose] = request.security(syminfo.tickerid, crtRefTF, [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
+[dailyBiasClose, dailyBiasOpen] = request.security(syminfo.tickerid, dailyBiasTF, [close, open], lookahead = barmerge.lookahead_off)
+dailyBiasBullish = dailyBiasClose > dailyBiasOpen
+
+if enableCRT and not na(refHigh) and refHigh != crtRefHigh
+    crtRefHigh := refHigh
+    crtRefLow  := refLow
+    crtLowSwept := false
+    crtHighSwept := false
+    crtZoneMitigatedBull := false
+    crtZoneMitigatedBear := false
+
+crtLowSweptNow  = enableCRT and not na(crtRefLow)  and low  < crtRefLow  and not crtZoneMitigatedBull
+crtHighSweptNow = enableCRT and not na(crtRefHigh) and high > crtRefHigh and not crtZoneMitigatedBear
+
+if crtLowSweptNow
+    crtLowSwept := true
+if crtHighSweptNow
+    crtHighSwept := true
+
+// Candle 3 confirmation: close back inside reference range after a sweep
+crtBullConfirm = enableCRT and crtLowSwept  and close > crtRefLow and close < crtRefHigh
+crtBearConfirm = enableCRT and crtHighSwept and close < crtRefHigh and close > crtRefLow
+
+// Tiered confidence: strict (sweep candle itself closed back inside) vs
+// flexible/Wyckoff (a LATER confirmation candle closes beyond the swept level
+// in trade direction; sweep candle's own close is secondary).
+sweepCandleClosedInsideBull = crtLowSweptNow and close > crtRefLow
+sweepCandleClosedInsideBear = crtHighSweptNow and close < crtRefHigh
+
+crtConfidence = "none"
+if crtBullConfirm
+    crtConfidence := sweepCandleClosedInsideBull ? "high" : "medium"
+    crtZoneMitigatedBull := true
+if crtBearConfirm
+    crtConfidence := sweepCandleClosedInsideBear ? "high" : "medium"
+    crtZoneMitigatedBear := true
+
+// Daily bias filter — only take CRT setups aligned with higher-timeframe bias
+crtBullAllowedByBias = dailyBiasBullish
+crtBearAllowedByBias = not dailyBiasBullish
+
+crtSignalBull = crtBullConfirm and crtConfidence != "none" and crtBullAllowedByBias
+crtSignalBear = crtBearConfirm and crtConfidence != "none" and crtBearAllowedByBias
+
+// -----------------------------------------------------------------------------
+// SMT DIVERGENCE — Pivot Points High/Low, compared across correlated symbols
+// -----------------------------------------------------------------------------
+selfPivHigh = ta.pivothigh(high, smtPivotLen, smtPivotLen)
+selfPivLow  = ta.pivotlow(low, smtPivotLen, smtPivotLen)
+
+[corrHighSeries, corrLowSeries] = request.security(correlatedSym, timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
+corrPivHigh = ta.pivothigh(corrHighSeries, smtPivotLen, smtPivotLen)
+corrPivLow  = ta.pivotlow(corrLowSeries, smtPivotLen, smtPivotLen)
+
+var float selfPrevPivHigh = na
+var float selfLastPivHigh = na
+var float selfPrevPivLow  = na
+var float selfLastPivLow  = na
+var float corrPrevPivHigh = na
+var float corrLastPivHigh = na
+var float corrPrevPivLow  = na
+var float corrLastPivLow  = na
+
+if not na(selfPivHigh)
+    selfPrevPivHigh := selfLastPivHigh
+    selfLastPivHigh := selfPivHigh
+if not na(selfPivLow)
+    selfPrevPivLow := selfLastPivLow
+    selfLastPivLow := selfPivLow
+if not na(corrPivHigh)
+    corrPrevPivHigh := corrLastPivHigh
+    corrLastPivHigh := corrPivHigh
+if not na(corrPivLow)
+    corrPrevPivLow := corrLastPivLow
+    corrLastPivLow := corrPivLow
+
+smtBearishDivergence = enableSMT and not na(selfPivHigh) and not na(selfPrevPivHigh) and not na(corrLastPivHigh) and not na(corrPrevPivHigh) and selfLastPivHigh > selfPrevPivHigh and corrLastPivHigh <= corrPrevPivHigh
+smtBullishDivergence = enableSMT and not na(selfPivLow) and not na(selfPrevPivLow) and not na(corrLastPivLow) and not na(corrPrevPivLow) and selfLastPivLow < selfPrevPivLow and corrLastPivLow >= corrPrevPivLow
+
+// -----------------------------------------------------------------------------
+// SETUP TRIGGER — objective gate only. Judgment-based checklist scoring
+// (alignment coherence, sweep quality, instrument cross-check) happens in the
+// backend LLM layer, not here.
+// -----------------------------------------------------------------------------
+structureOK_bull = bosUp or bullishStructure
+structureOK_bear = bosDown or bearishStructure
+
+killzoneOK = useKillzoneFilter ? inKillzone : true
+
+bullSetupObjective = bullFVG and priceInOTE and structureOK_bull and killzoneOK
+bearSetupObjective = bearFVG and priceInOTE and structureOK_bear and killzoneOK
+
+// -----------------------------------------------------------------------------
+// PLOTTING (visual confirmation on chart)
+// -----------------------------------------------------------------------------
+plotshape(bosUp,   title = "BOS Up",   style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0),  size = size.tiny)
+plotshape(bosDown, title = "BOS Down", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+plotshape(chochBullish, title = "CHOCH Bull", style = shape.circle, location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(chochBearish, title = "CHOCH Bear", style = shape.circle, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+
+var box bullFVGBox = na
+if bullFVG
+    bullFVGBox := box.new(bar_index[1], bullFVGTop, bar_index, bullFVGBottom, border_color = color.new(color.green, 60), bgcolor = color.new(color.green, 85))
+
+var box bearFVGBox = na
+if bearFVG
+    bearFVGBox := box.new(bar_index[1], bearFVGTop, bar_index, bearFVGBottom, border_color = color.new(color.red, 60), bgcolor = color.new(color.red, 85))
+
+plotshape(bullSetupObjective, title = "Bull Setup", style = shape.labelup, location = location.belowbar, color = color.new(color.blue, 0), text = "BULL", textcolor = color.white, size = size.small)
+plotshape(bearSetupObjective, title = "Bear Setup", style = shape.labeldown, location = location.abovebar, color = color.new(color.purple, 0), text = "BEAR", textcolor = color.white, size = size.small)
+
+// -----------------------------------------------------------------------------
+// WEBHOOK PAYLOAD — structured JSON, sent on any objective trigger
+// -----------------------------------------------------------------------------
+payloadSymbol = webhookSymbolOverride == "" ? syminfo.ticker : webhookSymbolOverride
+
+f_bool(b) => b ? "true" : "false"
+f_num(x)  => na(x) ? "null" : str.tostring(x)
+f_str(s)  => "\"" + s + "\""
+
+buildPayload(direction, targetPrice) =>
+    '{' +
+     '"event_id":' + f_str(str.tostring(time) + "_" + payloadSymbol + "_" + direction) + ',' +
+     '"timestamp":' + f_str(str.format("{0,date,yyyy-MM-dd'T'HH:mm:ss'Z'}", time)) + ',' +
+     '"symbol":' + f_str(payloadSymbol) + ',' +
+     '"setup_timeframe":' + f_str(timeframe.period) + ',' +
+     '"direction":' + f_str(direction) + ',' +
+     '"price":' + f_num(close) + ',' +
+     '"structure":{' +
+       '"bullish":' + f_bool(bullishStructure) + ',' +
+       '"bearish":' + f_bool(bearishStructure) + ',' +
+       '"bos_up":' + f_bool(bosUp) + ',' +
+       '"bos_down":' + f_bool(bosDown) + ',' +
+       '"choch_bull":' + f_bool(chochBullish) + ',' +
+       '"choch_bear":' + f_bool(chochBearish) +
+     '},' +
+     '"displacement":{' +
+       '"bull_fvg":' + f_bool(bullFVG) + ',' +
+       '"bear_fvg":' + f_bool(bearFVG) +
+     '},' +
+     '"ote":{' +
+       '"zone_high":' + f_num(oteHigh) + ',' +
+       '"zone_low":' + f_num(oteLow) + ',' +
+       '"trigger_0618":' + f_num(oteTrigger) + ',' +
+       '"price_in_zone":' + f_bool(priceInOTE) + ',' +
+       '"price_at_trigger":' + f_bool(priceAtTrigger) +
+     '},' +
+     '"killzone":' + f_str(killzoneName) + ',' +
+     '"mtf_context":{' +
+       '"bias_tf":' + f_str(biasTF) + ',' +
+       '"bias_close":' + f_num(biasClose) + ',' +
+       '"exec_tf":' + f_str(execTF) + ',' +
+       '"exec_close":' + f_num(execClose) +
+     '},' +
+     '"crt":{' +
+       '"enabled":' + f_bool(enableCRT) + ',' +
+       '"signal_bull":' + f_bool(crtSignalBull) + ',' +
+       '"signal_bear":' + f_bool(crtSignalBear) + ',' +
+       '"confidence":' + f_str(crtConfidence) + ',' +
+       '"ref_high":' + f_num(crtRefHigh) + ',' +
+       '"ref_low":' + f_num(crtRefLow) + ',' +
+       '"daily_bias_bullish":' + f_bool(dailyBiasBullish) +
+     '},' +
+     '"smt":{' +
+       '"enabled":' + f_bool(enableSMT) + ',' +
+       '"correlated_symbol":' + f_str(correlatedSym) + ',' +
+       '"bullish_divergence":' + f_bool(smtBullishDivergence) + ',' +
+       '"bearish_divergence":' + f_bool(smtBearishDivergence) +
+     '},' +
+     '"risk":{' +
+       '"stop_reference":' + f_num(legStart) + ',' +
+       '"stop_distance":' + f_num(stopDistance) + ',' +
+       '"est_risk_pct":' + f_num(riskPctOfEquity) + ',' +
+       '"within_cap":' + f_bool(riskWithinCap) + ',' +
+       '"cap_pct":' + f_num(riskCapPct) +
+     '},' +
+     '"target_reference":' + f_num(targetPrice) +
+    '}'
+
+if bullSetupObjective
+    alert(buildPayload("bullish", lastStructHigh), alert.freq_once_per_bar_close)
+
+if bearSetupObjective
+    alert(buildPayload("bearish", lastStructLow), alert.freq_once_per_bar_close)
+
+if crtSignalBull
+    alert(buildPayload("crt_bullish", crtRefHigh), alert.freq_once_per_bar_close)
+
+if crtSignalBear
+    alert(buildPayload("crt_bearish", crtRefLow), alert.freq_once_per_bar_close)

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Setup Confirmation Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #12151a;
+    --panel-border: #21262e;
+    --text: #e6e8eb;
+    --muted: #7c8592;
+    --bull: #21c37a;
+    --bear: #e6493f;
+    --pending: #d8a13a;
+    --accent: #3b7cf6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+  }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 24px; border-bottom: 1px solid var(--panel-border);
+  }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; margin: 0; }
+  .live-dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--bull); margin-right: 8px; animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .stats-bar {
+    display: flex; gap: 24px; padding: 16px 24px; border-bottom: 1px solid var(--panel-border);
+    background: var(--panel);
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat .value { font-size: 20px; font-weight: 600; }
+  main { padding: 16px 24px 60px; max-width: 900px; margin: 0 auto; }
+  .signal-card {
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 12px;
+  }
+  .signal-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .symbol { font-size: 16px; font-weight: 700; }
+  .direction { font-size: 12px; padding: 2px 8px; border-radius: 100px; font-weight: 600; text-transform: uppercase; }
+  .direction.bull { background: rgba(33,195,122,0.15); color: var(--bull); }
+  .direction.bear { background: rgba(230,73,63,0.15); color: var(--bear); }
+  .price { font-size: 13px; color: var(--muted); }
+  .decision-badge { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 6px; }
+  .decision-badge.CONFIRM { background: rgba(33,195,122,0.15); color: var(--bull); }
+  .decision-badge.REJECT { background: rgba(230,73,63,0.15); color: var(--bear); }
+  .rationale { font-size: 13px; color: var(--text); opacity: 0.85; margin: 10px 0; line-height: 1.5; }
+  .checklist { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .chk { font-size: 11px; padding: 3px 8px; border-radius: 6px; background: #1a1e25; color: var(--muted); }
+  .chk.pass { color: var(--bull); }
+  .chk.fail { color: var(--bear); }
+  .actions { display: flex; gap: 8px; }
+  button {
+    font-family: inherit; font-size: 12px; font-weight: 600; padding: 6px 14px;
+    border-radius: 6px; border: 1px solid var(--panel-border); background: transparent;
+    color: var(--text); cursor: pointer;
+  }
+  button.approve:hover { border-color: var(--bull); color: var(--bull); }
+  button.reject:hover { border-color: var(--bear); color: var(--bear); }
+  .manual-tag { font-size: 11px; color: var(--muted); }
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 13px; }
+  .timestamp { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function StatsBar({ stats }) {
+  if (!stats) return null;
+  return (
+    <div className="stats-bar">
+      <div className="stat"><span className="label">Total signals</span><span className="value mono">{stats.total_signals}</span></div>
+      <div className="stat"><span className="label">Confirmed</span><span className="value mono" style={{color:'var(--bull)'}}>{stats.confirmed}</span></div>
+      <div className="stat"><span className="label">Rejected</span><span className="value mono" style={{color:'var(--bear)'}}>{stats.rejected}</span></div>
+      <div className="stat"><span className="label">Manual overrides</span><span className="value mono">{stats.manual_overrides}</span></div>
+      <div className="stat"><span className="label">Expectancy (R)</span><span className="value mono">{stats.expectancy_r != null ? stats.expectancy_r.toFixed(2) : '—'}</span></div>
+    </div>
+  );
+}
+
+function ChecklistPills({ checklist }) {
+  if (!checklist) return null;
+  return (
+    <div className="checklist">
+      {Object.entries(checklist).map(([k, v]) => (
+        <span key={k} className={`chk ${v ? 'pass' : 'fail'}`}>{v ? '✓' : '✗'} {k.replaceAll('_', ' ')}</span>
+      ))}
+    </div>
+  );
+}
+
+function SignalCard({ signal, verdict, onOverride }) {
+  const isBull = signal.direction.includes('bull');
+  return (
+    <div className="signal-card">
+      <div className="signal-top">
+        <div>
+          <span className="symbol">{signal.symbol}</span>{' '}
+          <span className={`direction ${isBull ? 'bull' : 'bear'}`}>{signal.direction.replace('_', ' ')}</span>
+        </div>
+        {verdict && <span className={`decision-badge ${verdict.llm_decision}`}>{verdict.llm_decision}</span>}
+      </div>
+      <div className="price mono">Entry ref: {signal.price} <span className="timestamp">· {new Date(signal.received_at).toLocaleString()}</span></div>
+      {verdict && <>
+        <ChecklistPills checklist={verdict.checklist} />
+        <div className="rationale">{verdict.rationale}</div>
+        {verdict.manual_decision ? (
+          <span className="manual-tag">Manually {verdict.manual_decision.toLowerCase()}d</span>
+        ) : (
+          <div className="actions">
+            <button className="approve" onClick={() => onOverride(verdict.id, 'APPROVE')}>Approve</button>
+            <button className="reject" onClick={() => onOverride(verdict.id, 'REJECT')}>Reject</button>
+          </div>
+        )}
+      </>}
+      {!verdict && <div className="rationale" style={{color:'var(--pending)'}}>Confirmation pending or failed — review manually.</div>}
+    </div>
+  );
+}
+
+function App() {
+  const [signals, setSignals] = useState([]);
+  const [stats, setStats] = useState(null);
+  const wsRef = useRef(null);
+
+  const loadInitial = async () => {
+    const [sigRes, statsRes] = await Promise.all([fetch('/api/signals'), fetch('/api/stats')]);
+    if (sigRes.status === 401) { window.location.href = '/login'; return; }
+    setSignals(await sigRes.json());
+    setStats(await statsRes.json());
+  };
+
+  useEffect(() => {
+    loadInitial();
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${window.location.host}/ws/signals`);
+    ws.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === 'new_signal') {
+        setSignals((prev) => [{ ...msg.signal, verdict: msg.verdict }, ...prev]);
+        fetch('/api/stats').then(r => r.json()).then(setStats);
+      }
+    };
+    wsRef.current = ws;
+    return () => ws.close();
+  }, []);
+
+  const handleOverride = async (verdictId, decision) => {
+    await fetch(`/api/verdicts/${verdictId}/override`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+    loadInitial();
+  };
+
+  return (
+    <>
+      <header>
+        <h1><span className="live-dot"></span>SETUP CONFIRMATION DASHBOARD</h1>
+      </header>
+      <StatsBar stats={stats} />
+      <main>
+        {signals.length === 0 && <div className="empty">No signals yet. Waiting for the first alert from TradingView.</div>}
+        {signals.map((s) => (
+          <SignalCard key={s.id} signal={s} verdict={s.verdict} onOverride={handleOverride} />
+        ))}
+      </main>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
