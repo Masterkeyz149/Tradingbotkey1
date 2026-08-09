@@ -6,7 +6,7 @@ still requires the DB record to exist and be unexpired.
 """
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Request, HTTPException, Response
+from fastapi import Depends, Request, HTTPException, Response
 from sqlalchemy.orm import Session as DBSession
 
 from backend.config import get_settings
@@ -38,25 +38,16 @@ def create_session(db: DBSession, response: Response, email: str) -> None:
     )
 
 
-def require_session(request: Request, db: DBSession = None) -> str:
+def require_session(request: Request, db: DBSession = Depends(get_db)) -> str:
     """FastAPI dependency: raises 401 if there's no valid session, else
-    returns the logged-in user's email."""
-    from backend.db.session import SessionLocal
-    own_db = False
-    if db is None:
-        db = SessionLocal()
-        own_db = True
+    returns the logged-in user's email.
+    """
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    try:
-        session_id = request.cookies.get(SESSION_COOKIE_NAME)
-        if not session_id:
-            raise HTTPException(status_code=401, detail="Not authenticated")
+    record = db.query(UserSession).filter(UserSession.id == session_id).first()
+    if not record or record.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
 
-        record = db.query(UserSession).filter(UserSession.id == session_id).first()
-        if not record or record.expires_at < datetime.now(timezone.utc):
-            raise HTTPException(status_code=401, detail="Session expired")
-
-        return record.email
-    finally:
-        if own_db:
-            db.close()
+    return record.email
