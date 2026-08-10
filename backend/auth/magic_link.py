@@ -59,7 +59,7 @@ def _send_email(to_email: str, link: str) -> None:
     provider -- the rest of the auth flow doesn't care."""
     if not settings.EMAIL_PROVIDER_API_KEY:
         # Dev fallback: log the link instead of emailing it.
-        log_event(logger, "magic_link_dev_mode_no_email_sent", link=link)
+        log_event(logger, f"magic_link_dev_mode_no_email_sent link={link}", link=link)
         return
 
     try:
