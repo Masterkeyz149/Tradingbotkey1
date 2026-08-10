@@ -1,12 +1,100 @@
-from fastapi import APIRouter, Depends, Query, Request
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, Query, Request, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.auth.session import require_session
-from backend.db.models import Signal, Verdict
+from backend.confirmation.llm_client import get_confirmation, LLMConfirmationError
+from backend.dashboard.ws import broadcast_new_signal
+from backend.db.models import Signal, Verdict, AuditLog
 from backend.db.session import get_db
+from backend.config import get_settings
 
 router = APIRouter()
+settings = get_settings()
+
+
+class ManualSignalRequest(BaseModel):
+    symbol: str
+    direction: str  # "bullish" | "bearish"
+    price: float
+    htf_bias_aligned: bool
+    liquidity_swept: bool
+    structure_break_confirmed: bool
+    displacement_present: bool
+    price_in_ote: bool
+    notes: str = ""
+
+
+@router.post("/api/manual-signal")
+async def submit_manual_signal(
+    body: ManualSignalRequest,
+    db: Session = Depends(get_db),
+    user_email: str = Depends(require_session),
+):
+    """Log a signal you spotted yourself on the chart -- runs through the
+    same LLM confirmation checklist as an automated webhook signal, without
+    needing TradingView's webhook feature. Requires being logged in, since
+    (unlike the webhook) this route trusts the caller's identity instead of
+    a shared secret."""
+    if body.direction not in ("bullish", "bearish"):
+        raise HTTPException(status_code=400, detail="direction must be 'bullish' or 'bearish'")
+
+    payload_dict = {
+        "event_id": f"manual_{uuid.uuid4()}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": body.symbol.upper(),
+        "direction": body.direction,
+        "price": body.price,
+        "source": "manual_entry",
+        "entered_by": user_email,
+        "checklist_inputs": {
+            "htf_bias_aligned": body.htf_bias_aligned,
+            "liquidity_swept": body.liquidity_swept,
+            "structure_break_confirmed": body.structure_break_confirmed,
+            "displacement_present": body.displacement_present,
+            "price_in_ote": body.price_in_ote,
+        },
+        "notes": body.notes,
+    }
+
+    signal = Signal(
+        event_id=payload_dict["event_id"],
+        symbol=payload_dict["symbol"],
+        direction=body.direction,
+        setup_timeframe="manual",
+        price=body.price,
+        raw_payload=payload_dict,
+    )
+    db.add(signal)
+    db.commit()
+    db.refresh(signal)
+
+    db.add(AuditLog(actor=user_email, action="manual_signal_entered", details={"event_id": signal.event_id}))
+    db.commit()
+
+    try:
+        llm_verdict = get_confirmation(payload_dict)
+    except LLMConfirmationError as e:
+        raise HTTPException(status_code=502, detail=f"LLM confirmation failed; signal saved for manual review: {e}")
+
+    verdict = Verdict(
+        signal_id=signal.id,
+        llm_decision=llm_verdict.decision,
+        checklist=llm_verdict.checklist,
+        rationale=llm_verdict.rationale,
+        model_used=settings.LLM_MODEL,
+    )
+    db.add(verdict)
+    db.commit()
+    db.refresh(verdict)
+
+    await broadcast_new_signal(signal, verdict)
+
+    return {"status": "processed", "decision": llm_verdict.decision}
 
 
 @router.get("/api/signals")
