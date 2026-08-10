@@ -71,6 +71,35 @@
   .manual-tag { font-size: 11px; color: var(--muted); }
   .empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 13px; }
   .timestamp { font-size: 11px; color: var(--muted); }
+  .manual-entry-btn {
+    background: var(--accent); color: white; border: none; padding: 8px 16px;
+    border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
+    align-items: center; justify-content: center; z-index: 10;
+  }
+  .modal {
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
+    padding: 24px; width: 380px; max-height: 85vh; overflow-y: auto;
+  }
+  .modal h2 { font-size: 15px; margin: 0 0 16px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field input[type=text], .field input[type=number], .field select, .field textarea {
+    width: 100%; padding: 8px; border-radius: 6px; border: 1px solid var(--panel-border);
+    background: var(--bg); color: var(--text); font-family: inherit; font-size: 13px; box-sizing: border-box;
+  }
+  .checkbox-field { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .checkbox-field label { font-size: 13px; color: var(--text); }
+  .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
+  .modal-actions button {
+    flex: 1; padding: 10px; border-radius: 6px; border: none; font-weight: 600;
+    font-size: 13px; cursor: pointer;
+  }
+  .btn-submit { background: var(--accent); color: white; }
+  .btn-cancel { background: transparent; color: var(--muted); border: 1px solid var(--panel-border) !important; }
+  .error-text { color: var(--bear); font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -136,9 +165,92 @@ function SignalCard({ signal, verdict, onOverride }) {
   );
 }
 
+function ManualEntryModal({ onClose, onSubmitted }) {
+  const [form, setForm] = useState({
+    symbol: '', direction: 'bullish', price: '',
+    htf_bias_aligned: false, liquidity_swept: false,
+    structure_break_confirmed: false, displacement_present: false,
+    price_in_ote: false, notes: '',
+  });
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const update = (field, value) => setForm((f) => ({ ...f, [field]: value }));
+
+  const submit = async () => {
+    if (!form.symbol || !form.price) { setError('Symbol and price are required.'); return; }
+    setSubmitting(true);
+    setError('');
+    try {
+      const res = await fetch('/api/manual-signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...form, price: parseFloat(form.price) }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || 'Something went wrong.');
+      }
+      onSubmitted();
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const checklistFields = [
+    ['htf_bias_aligned', 'Higher-timeframe bias aligned (4H/30M/5M agree)'],
+    ['liquidity_swept', 'Liquidity sweep occurred'],
+    ['structure_break_confirmed', 'Structure break confirmed on a close'],
+    ['displacement_present', 'Displacement present (FVG formed)'],
+    ['price_in_ote', 'Price retraced into OTE zone (0.618-0.786)'],
+  ];
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>Log a signal you spotted</h2>
+        <div className="field">
+          <label>Symbol</label>
+          <input type="text" value={form.symbol} onChange={(e) => update('symbol', e.target.value)} placeholder="XAUUSD" />
+        </div>
+        <div className="field">
+          <label>Direction</label>
+          <select value={form.direction} onChange={(e) => update('direction', e.target.value)}>
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>Price</label>
+          <input type="number" step="any" value={form.price} onChange={(e) => update('price', e.target.value)} placeholder="2415.32" />
+        </div>
+        {checklistFields.map(([key, label]) => (
+          <div className="checkbox-field" key={key}>
+            <input type="checkbox" id={key} checked={form[key]} onChange={(e) => update(key, e.target.checked)} />
+            <label htmlFor={key}>{label}</label>
+          </div>
+        ))}
+        <div className="field">
+          <label>Notes (optional)</label>
+          <textarea rows="2" value={form.notes} onChange={(e) => update('notes', e.target.value)} placeholder="Anything else worth noting" />
+        </div>
+        {error && <div className="error-text">{error}</div>}
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose} disabled={submitting}>Cancel</button>
+          <button className="btn-submit" onClick={submit} disabled={submitting}>{submitting ? 'Checking...' : 'Submit for AI check'}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [signals, setSignals] = useState([]);
   const [stats, setStats] = useState(null);
+  const [showModal, setShowModal] = useState(false);
   const wsRef = useRef(null);
 
   const loadInitial = async () => {
@@ -175,7 +287,9 @@ function App() {
     <>
       <header>
         <h1><span className="live-dot"></span>SETUP CONFIRMATION DASHBOARD</h1>
+        <button className="manual-entry-btn" onClick={() => setShowModal(true)}>+ Log Signal</button>
       </header>
+      {showModal && <ManualEntryModal onClose={() => setShowModal(false)} onSubmitted={loadInitial} />}
       <StatsBar stats={stats} />
       <main>
         {signals.length === 0 && <div className="empty">No signals yet. Waiting for the first alert from TradingView.</div>}
